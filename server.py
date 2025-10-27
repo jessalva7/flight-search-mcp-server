@@ -2,14 +2,173 @@
 """Flight Search MCP Server using SearchAPI.io Google Flights API"""
 
 import os
+import time
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
 import httpx
+import psycopg2
+from sentence_transformers import SentenceTransformer
 
 mcp = FastMCP("flight-search")
 
 SEARCHAPI_KEY = os.getenv("SEARCHAPI_KEY", )
+
+# Database connection parameters
+DB_CONFIG = {
+    'host': 'localhost',
+    'port': 5432,
+    'database': 'vectordb',
+    'user': 'postgres',
+    'password': 'postgres'
+}
+
+# Initialize embedding model
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 SEARCHAPI_URL = "https://www.searchapi.io/api/v1/search"
+
+
+@mcp.tool()
+def search_airport(query: str, limit: int = 5) -> dict:
+    """Search for airports by name or city using hybrid search (vector + keyword).
+
+    Args:
+        query: Airport name or city name to search for (e.g., "Los Angeles", "JFK Airport", "Pearson")
+        limit: Maximum number of results to return (default: 5)
+
+    Returns:
+        List of matching airports with their codes, names, cities, and countries
+    """
+    try:
+        # Remove "Airport" from query for embedding
+        query_for_embedding = query.replace(' Airport', '').replace(' airport', '')
+        
+        # Generate embedding for the query
+        start_time = time.time()
+        query_embedding = embedding_model.encode(query_for_embedding).tolist()
+        embedding_time = time.time() - start_time
+        print(f"Embedding generation took {embedding_time:.4f} seconds")
+        
+        # Connect to database
+        conn = psycopg2.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        
+        # Hybrid search: combine vector similarity with keyword matching
+        query_start_time = time.time()
+        cursor.execute("""
+            WITH keyword_matches AS (
+                SELECT 
+                    airport_id, name, city, country, iata, icao, tz_database_timezone,
+                    1.0 as keyword_score,
+                    0 as name_similarity,
+                    0 as city_similarity,
+                    CASE
+                        WHEN UPPER(iata) = UPPER(%s) THEN 'iata'
+                        WHEN UPPER(icao) = UPPER(%s) THEN 'icao'
+                        WHEN name ILIKE %s THEN 'name_keyword'
+                        WHEN city ILIKE %s THEN 'city_keyword'
+                    END as match_type
+                FROM airports
+                WHERE 
+                    UPPER(iata) = UPPER(%s)
+                    OR UPPER(icao) = UPPER(%s)
+                    OR name ILIKE %s
+                    OR city ILIKE %s
+                LIMIT %s
+            ),
+            name_matches AS (
+                SELECT 
+                    airport_id, name, city, country, iata, icao, tz_database_timezone,
+                    0 as keyword_score,
+                    1 - (name_vector <=> %s::vector) as name_similarity,
+                    0 as city_similarity,
+                    'name_vector' as match_type
+                FROM airports
+                WHERE name_vector IS NOT NULL
+                ORDER BY name_vector <=> %s::vector
+                LIMIT %s
+            ),
+            city_matches AS (
+                SELECT 
+                    airport_id, name, city, country, iata, icao, tz_database_timezone,
+                    0 as keyword_score,
+                    0 as name_similarity,
+                    1 - (city_vector <=> %s::vector) as city_similarity,
+                    'city_vector' as match_type
+                FROM airports
+                WHERE city_vector IS NOT NULL
+                ORDER BY city_vector <=> %s::vector
+                LIMIT %s
+            ),
+            combined AS (
+                SELECT * FROM keyword_matches
+                UNION ALL
+                SELECT * FROM name_matches
+                UNION ALL
+                SELECT * FROM city_matches
+            )
+            SELECT 
+                airport_id, name, city, country, iata, icao, tz_database_timezone,
+                MAX(keyword_score) as keyword_score,
+                MAX(name_similarity) as name_sim,
+                MAX(city_similarity) as city_sim,
+                GREATEST(MAX(keyword_score), MAX(name_similarity), MAX(city_similarity)) as best_score,
+                (array_agg(match_type ORDER BY 
+                    CASE match_type
+                        WHEN 'iata' THEN 1
+                        WHEN 'icao' THEN 2
+                        WHEN 'name_keyword' THEN 3
+                        WHEN 'city_keyword' THEN 4
+                        WHEN 'name_vector' THEN 5
+                        WHEN 'city_vector' THEN 6
+                    END
+                ))[1] as primary_match_type
+            FROM combined
+            GROUP BY airport_id, name, city, country, iata, icao, tz_database_timezone
+            ORDER BY best_score DESC
+            LIMIT %s;
+        """, (
+            query, query, f'%{query}%', f'%{query}%',
+            query, query, f'%{query}%', f'%{query}%', limit * 2,
+            query_embedding, query_embedding, limit * 2,
+            query_embedding, query_embedding, limit * 2,
+            limit
+        ))
+        query_time = time.time() - query_start_time
+        print(f"pgvector query took {query_time:.4f} seconds")
+        
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                "airport_id": row[0],
+                "name": row[1],
+                "city": row[2],
+                "country": row[3],
+                "iata": row[4],
+                "icao": row[5],
+                "timezone": row[6],
+                "similarity_score": round(row[10], 4),
+                "matched_by": row[11]  # primary_match_type from query
+            })
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            "query": query,
+            "results_count": len(results),
+            "airports": results,
+            "timing": {
+                "embedding_ms": round(embedding_time * 1000, 2),
+                "query_ms": round(query_time * 1000, 2),
+                "total_ms": round((embedding_time + query_time) * 1000, 2)
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "error": "Search failed",
+            "message": str(e)
+        }
 
 
 def format_flight_results(data: dict) -> dict:
@@ -132,3 +291,10 @@ async def search_flights(
             "error": "Unexpected error",
             "message": str(e),
         }
+
+
+if __name__ == "__main__":
+    try:
+        mcp.run()
+    except Exception as e:
+        print(f"Server error: {e}", file=sys.stderr)
